@@ -80,6 +80,16 @@ static void buildM(const Xform& x, double M[6]){
 }
 static inline void applyM(const double M[6],double u,double v,double&x,double&y){ x=M[0]*u+M[1]*v+M[2]; y=M[3]*u+M[4]*v+M[5]; }
 
+static const float CONF_HI=50.f;   // high-confidence gate for depth points
+// interpolate the depth->thermal transform by scene distance (min slot .. max slot)
+static Xform interpX(double d){
+    double span=g_cal.max_d-g_cal.min_d; if(std::abs(span)<1e-6)span=1;
+    double t=(d-g_cal.min_d)/span; t=std::max(-0.5,std::min(1.5,t));
+    const Xform&a=g_cal.min_x; const Xform&b=g_cal.max_x; Xform o;
+    o.tx=a.tx+t*(b.tx-a.tx); o.ty=a.ty+t*(b.ty-a.ty);
+    o.s=a.s+t*(b.s-a.s); o.rot=a.rot+t*(b.rot-a.rot); return o;
+}
+
 // ---------------------------------------------------------------------------
 static bool g_running=true, g_cal_mode=false, g_min_slot=true, g_cmd_capture=false;
 static double g_opacity=0.6; static int g_palette=2; uint8_t is_streaming=0;
@@ -422,13 +432,13 @@ int main(){
             g_depth_sh.copyTo(depth_f); g_conf_sh.copyTo(conf_f);
         }
         if(!depth_f.empty()){
-            live_d=center_depth(depth_f,conf_f,30.f);
+            live_d=center_depth(depth_f,conf_f,CONF_HI);
             // auto-track color range to the ROBUST valid-depth spread (5th..95th
             // percentile) so a few noise/background outliers don't blow it out.
             std::vector<float> vv; vv.reserve(DW*DH/2);
             for(int y=0;y<DH;y++){ const float* dp=depth_f.ptr<float>(y); const float* cp=conf_f.ptr<float>(y);
                 for(int x=0;x<DW;x+=2){ float d=dp[x];
-                    if(cp[x]>=30.f && d>150.f && d<RANGE_MM*0.98f) vv.push_back(d); } }
+                    if(cp[x]>=CONF_HI && d>150.f && d<RANGE_MM*0.98f) vv.push_back(d); } }
             if(vv.size()>100){
                 size_t lo=vv.size()*5/100, hi=vv.size()*95/100;
                 std::nth_element(vv.begin(),vv.begin()+lo,vv.end()); float p5=vv[lo];
@@ -438,15 +448,42 @@ int main(){
             }
         }
 
-        // arducam camera image (amplitude), auto-gain grayscale, used for BOTH the
-        // overlap on thermal and (colorized) the separate depth feed source.
+        // raw arducam camera image (amplitude) for the separate feed
         cv::Mat amp8;
         if(!conf_f.empty()) cv::normalize(conf_f,amp8,0,255,cv::NORM_MINMAX,CV_8U);
 
-        cv::Mat ocol,omask,odepth;
-        scatter_overlay(depth_f,conf_f,amp8,g_cal_mode,g_min_slot,ocol,omask,odepth);
-        cv::Mat fused=thermal.clone();   // THERMAL + Arducam CAMERA overlapped
-        if(cv::countNonZero(omask)>0){ cv::Mat bl; cv::addWeighted(thermal,1.0-g_opacity,ocol,g_opacity,0,bl); bl.copyTo(fused,omask); }
+        // temporal smoothing of depth (kills flicker); high-confidence only
+        static cv::Mat g_dema;
+        if(!depth_f.empty()){
+            if(g_dema.empty()||g_dema.size()!=depth_f.size()) depth_f.copyTo(g_dema);
+            else { cv::Mat valid=(conf_f>=CONF_HI)&(depth_f>150.f);
+                   cv::Mat mix; cv::addWeighted(g_dema,0.6,depth_f,0.4,0,mix); mix.copyTo(g_dema,valid); }
+        }
+
+        // ---- DEPTH overlay on thermal: dense warp at scene transform, color-by-
+        // distance, high-confidence + smoothed (clean, no per-point-scatter noise) ----
+        cv::Mat omask, odepth; cv::Mat fused=thermal.clone();
+        if(!g_dema.empty()){
+            cv::Mat ds=g_dema.clone(), cs=conf_f.clone();
+            if(g_cal.flipH){ cv::flip(ds,ds,1); cv::flip(cs,cs,1); }
+            if(g_cal.flipV){ cv::flip(ds,ds,0); cv::flip(cs,cs,0); }
+            Xform X = g_cal_mode ? (g_min_slot?g_cal.min_x:g_cal.max_x)
+                                 : interpX(std::isnan(live_d)?(g_cal.min_d+g_cal.max_d)/2:live_d);
+            double M6[6]; buildM(X,M6);
+            cv::Mat M=(cv::Mat_<double>(2,3)<<M6[0],M6[1],M6[2],M6[3],M6[4],M6[5]);
+            cv::Mat wdepth,wconf;
+            cv::warpAffine(ds,wdepth,M,cv::Size(TW,TH),cv::INTER_NEAREST,cv::BORDER_CONSTANT,cv::Scalar(0));
+            cv::warpAffine(cs,wconf,M,cv::Size(TW,TH),cv::INTER_NEAREST,cv::BORDER_CONSTANT,cv::Scalar(0));
+            cv::Mat vmask=(wconf>=CONF_HI)&(wdepth>150)&(wdepth<(float)RANGE_MM*0.98f);
+            static cv::Mat k3=cv::getStructuringElement(cv::MORPH_RECT,cv::Size(3,3));
+            cv::morphologyEx(vmask,vmask,cv::MORPH_OPEN,k3);    // drop speckle
+            cv::morphologyEx(vmask,vmask,cv::MORPH_CLOSE,k3);   // fill pinholes
+            double span=g_cmax-g_cmin; if(span<50)span=50;
+            cv::Mat d8; wdepth.convertTo(d8,CV_8U,255.0/span,-g_cmin*255.0/span);
+            cv::Mat ocol; cv::applyColorMap(d8,ocol,cv::COLORMAP_JET);
+            cv::Mat bl; cv::addWeighted(thermal,1.0-g_opacity,ocol,g_opacity,0,bl); bl.copyTo(fused,vmask);
+            omask=vmask; wdepth.copyTo(odepth); odepth.setTo(0,~vmask);
+        }
 
         cv::Mat ui(480,800,CV_8UC3,cv::Scalar(22,22,22));
         // main overlay
@@ -459,13 +496,10 @@ int main(){
             cv::rectangle(ui,cv::Rect(COLX,y,COLW,F_H),cv::Scalar(80,80,80),1);
             cv::putText(ui,lbl,cv::Point(COLX+4,y+15),cv::FONT_HERSHEY_SIMPLEX,0.42,lc,1);
         };
-        // DEPTH feed only (separate) - no separate arducam feed; arducam cam is
-        // overlapped on the thermal in the main pane above.
-        cv::Mat rd;
-        if(!depth_f.empty()){ double span=g_cmax-g_cmin; if(span<50)span=50;
-            cv::Mat d8; depth_f.convertTo(d8,CV_8U,255.0/span,-g_cmin*255.0/span);
-            cv::applyColorMap(d8,rd,cv::COLORMAP_JET); rd.setTo(cv::Scalar(0,0,0),conf_f<30); }
-        feed(rd,F1Y,"DEPTH",cv::Scalar(0,200,255));
+        // RAW ARDUCAM feed (amplitude), separate - depth is now the overlay above.
+        cv::Mat rawcam;
+        if(!amp8.empty()) cv::cvtColor(amp8,rawcam,cv::COLOR_GRAY2BGR);
+        feed(rawcam,F1Y,"ARDUCAM",cv::Scalar(200,200,0));
 
         // HUD
         std::stringstream ss;
@@ -490,7 +524,7 @@ int main(){
             auto t=std::time(nullptr);auto lt=*std::localtime(&t);char st[32];std::strftime(st,sizeof(st),"%Y%m%d_%H%M%S",&lt);
             std::string b=std::string("fusion_")+st;
             cv::imwrite(b+"_thermal.png",thermal); cv::imwrite(b+"_overlay.png",fused);
-            if(!rd.empty())cv::imwrite(b+"_depth_raw.png",rd); if(!amp8.empty())cv::imwrite(b+"_arducam_cam.png",amp8);
+            if(!amp8.empty())cv::imwrite(b+"_arducam_cam.png",amp8);
             {std::ofstream f(b+"_depth_f32_"+std::to_string(TW)+"x"+std::to_string(TH)+".raw",std::ios::binary);
              if(!odepth.empty())f.write((char*)odepth.data,TW*TH*sizeof(float));}
             {std::ofstream f(b+"_meta.json");
