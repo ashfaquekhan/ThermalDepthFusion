@@ -1,0 +1,13 @@
+# Build output
+thermal_depth_fusion
+*.o
+
+# Runtime output
+fusion_*.png
+*.raw
+*.log
+thermal_depth_calibration.json
+
+# Editor / OS
+*.swp
+.DS_Store
