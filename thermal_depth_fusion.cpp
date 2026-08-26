@@ -92,6 +92,7 @@ static Xform interpX(double d){
 // ---------------------------------------------------------------------------
 static bool g_running=true, g_cal_mode=false, g_min_slot=true, g_cmd_capture=false;
 static bool g_outline_only=false;   // show only colored depth outlines (no fill)
+static bool g_show_thermal=true, g_show_depth=true;   // independent visual layer toggles
 static double g_opacity=0.6; static int g_palette=2; uint8_t is_streaming=0;
 
 // depth acquired on its own thread so the thermal loop never blocks on it
@@ -108,7 +109,7 @@ static const int NPAL=sizeof(PALS)/sizeof(PALS[0]);
 // on-screen buttons -----------------------------------------------------------
 enum { A_CAL,A_SLOT,A_LEFT,A_UP,A_DOWN,A_RIGHT,A_SM,A_SP,
        A_RM,A_RP,A_FH,A_FV,A_SETMIN,A_SETMAX,A_OPM,A_OPP,
-       A_PAL,A_OUTLINE,A_SAVE,A_LOAD,A_RESET,A_CAP,A_QUIT };
+       A_PAL,A_OUTLINE,A_THERM,A_DEPTHV,A_SAVE,A_LOAD,A_RESET,A_CAP,A_QUIT };
 struct Btn { cv::Rect r; std::string label; int act; bool active; };
 static std::vector<Btn> g_btns;
 static volatile int g_action=-1;
@@ -215,6 +216,7 @@ static void layout_buttons(){
     A(r1,"Rot-",A_RM); A(r1,"Rot+",A_RP); A(r1,"FlipH",A_FH,g_cal.flipH); A(r1,"FlipV",A_FV,g_cal.flipV);
     A(r1,"SetMin",A_SETMIN); A(r1,"SetMax",A_SETMAX); A(r1,"Op-",A_OPM); A(r1,"Op+",A_OPP);
     A(r2,"Palette",A_PAL); A(r2,"Outline",A_OUTLINE,g_outline_only);
+    A(r2,"Therm",A_THERM,g_show_thermal); A(r2,"Depth",A_DEPTHV,g_show_depth);
     A(r2,"Save",A_SAVE); A(r2,"Load",A_LOAD); A(r2,"Reset",A_RESET);
     A(r2,"Capture",A_CAP); A(r2,"Quit",A_QUIT);
     rows={r0,r1,r2};
@@ -246,6 +248,8 @@ static void apply_action(int act){
         case A_OPP: g_opacity=std::min(1.0,g_opacity+0.05); break;
         case A_PAL: g_palette=(g_palette+1)%NPAL; break;
         case A_OUTLINE: g_outline_only=!g_outline_only; break;
+        case A_THERM:   g_show_thermal=!g_show_thermal; break;
+        case A_DEPTHV:  g_show_depth=!g_show_depth; break;
         case A_SAVE:save_cal(); break; case A_LOAD:load_cal(); break;
         case A_RESET:*X=Xform{0,0,(double)TW/DW,0}; break;
         case A_CAP: g_cmd_capture=true; break;
@@ -464,7 +468,8 @@ int main(){
         // ---- clean depth overlay via DENSE warp at the scene transform ----
         // (replaces the per-point forward scatter, which was holey/noisy). One affine
         // warp of the whole depth image -> a solid region; outline = its silhouette.
-        cv::Mat omask, odepth; cv::Mat fused=thermal.clone();
+        cv::Mat base = g_show_thermal ? thermal : cv::Mat::zeros(thermal.size(),thermal.type());
+        cv::Mat omask, odepth; cv::Mat fused=base.clone();
         if(!g_dema.empty()){
             cv::Mat ds=g_dema.clone(), cs=conf_f.clone();
             if(g_cal.flipH){ cv::flip(ds,ds,1); cv::flip(cs,cs,1); }
@@ -483,12 +488,15 @@ int main(){
             double span=g_cmax-g_cmin; if(span<50)span=50;
             cv::Mat d8; wdepth.convertTo(d8,CV_8U,255.0/span,-g_cmin*255.0/span);
             cv::Mat ocol; cv::applyColorMap(d8,ocol,cv::COLORMAP_JET);
-            if(!g_outline_only){ cv::Mat bl; cv::addWeighted(thermal,1.0-g_opacity,ocol,g_opacity,0,bl); bl.copyTo(fused,vmask); }
             cv::Mat sil; cv::morphologyEx(vmask,sil,cv::MORPH_GRADIENT,k3);   // clean object silhouette
             cv::Mat edg; cv::Canny(d8,edg,50,140); edg&=vmask;               // internal depth edges
             cv::Mat outline=sil|edg; cv::dilate(outline,outline,k3);
-            ocol.copyTo(fused,outline);                                      // distance-colored outline
-            omask=vmask; wdepth.copyTo(odepth); odepth.setTo(0,~vmask);
+            omask=vmask; wdepth.copyTo(odepth); odepth.setTo(0,~vmask);       // always kept for capture
+            if(g_show_depth){   // DRAW the depth layer (view toggle only; streaming unaffected)
+                double op = g_show_thermal ? g_opacity : 1.0;   // full depth when thermal hidden
+                if(!g_outline_only){ cv::Mat bl; cv::addWeighted(base,1.0-op,ocol,op,0,bl); bl.copyTo(fused,vmask); }
+                ocol.copyTo(fused,outline);                                  // distance-colored outline
+            }
         }
 
         cv::Mat ui(480,800,CV_8UC3,cv::Scalar(22,22,22));
