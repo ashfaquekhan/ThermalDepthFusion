@@ -82,6 +82,7 @@ static inline void applyM(const double M[6],double u,double v,double&x,double&y)
 
 // ---------------------------------------------------------------------------
 static bool g_running=true, g_cal_mode=false, g_min_slot=true, g_cmd_capture=false;
+static bool g_outline_only=false;   // show only colored depth outlines (no fill)
 static double g_opacity=0.6; static int g_palette=2; uint8_t is_streaming=0;
 
 // depth acquired on its own thread so the thermal loop never blocks on it
@@ -98,7 +99,7 @@ static const int NPAL=sizeof(PALS)/sizeof(PALS[0]);
 // on-screen buttons -----------------------------------------------------------
 enum { A_CAL,A_SLOT,A_LEFT,A_UP,A_DOWN,A_RIGHT,A_SM,A_SP,
        A_RM,A_RP,A_FH,A_FV,A_SETMIN,A_SETMAX,A_OPM,A_OPP,
-       A_PAL,A_SAVE,A_LOAD,A_RESET,A_CAP,A_QUIT };
+       A_PAL,A_OUTLINE,A_SAVE,A_LOAD,A_RESET,A_CAP,A_QUIT };
 struct Btn { cv::Rect r; std::string label; int act; bool active; };
 static std::vector<Btn> g_btns;
 static volatile int g_action=-1;
@@ -204,7 +205,8 @@ static void layout_buttons(){
     A(r0,"Sc-",A_SM); A(r0,"Sc+",A_SP);
     A(r1,"Rot-",A_RM); A(r1,"Rot+",A_RP); A(r1,"FlipH",A_FH,g_cal.flipH); A(r1,"FlipV",A_FV,g_cal.flipV);
     A(r1,"SetMin",A_SETMIN); A(r1,"SetMax",A_SETMAX); A(r1,"Op-",A_OPM); A(r1,"Op+",A_OPP);
-    A(r2,"Palette",A_PAL); A(r2,"Save",A_SAVE); A(r2,"Load",A_LOAD); A(r2,"Reset",A_RESET);
+    A(r2,"Palette",A_PAL); A(r2,"Outline",A_OUTLINE,g_outline_only);
+    A(r2,"Save",A_SAVE); A(r2,"Load",A_LOAD); A(r2,"Reset",A_RESET);
     A(r2,"Capture",A_CAP); A(r2,"Quit",A_QUIT);
     rows={r0,r1,r2};
     int margin=4,gap=3,rowH=36,rowGap=4;
@@ -234,6 +236,7 @@ static void apply_action(int act){
         case A_OPM: g_opacity=std::max(0.0,g_opacity-0.05); break;
         case A_OPP: g_opacity=std::min(1.0,g_opacity+0.05); break;
         case A_PAL: g_palette=(g_palette+1)%NPAL; break;
+        case A_OUTLINE: g_outline_only=!g_outline_only; break;
         case A_SAVE:save_cal(); break; case A_LOAD:load_cal(); break;
         case A_RESET:*X=Xform{0,0,(double)TW/DW,0}; break;
         case A_CAP: g_cmd_capture=true; break;
@@ -445,7 +448,8 @@ int main(){
         scatter_overlay(depth_f,conf_f,g_cal_mode,g_min_slot,ocol,omask,odepth);
         cv::Mat fused=thermal.clone();   // THERMAL + depth (color-by-distance + outline)
         if(cv::countNonZero(omask)>0){
-            cv::Mat bl; cv::addWeighted(thermal,1.0-g_opacity,ocol,g_opacity,0,bl); bl.copyTo(fused,omask);
+            // color-by-distance fill (skipped in outline-only mode)
+            if(!g_outline_only){ cv::Mat bl; cv::addWeighted(thermal,1.0-g_opacity,ocol,g_opacity,0,bl); bl.copyTo(fused,omask); }
             // crisp distance-colored OUTLINE at depth edges (object silhouettes) - the
             // key feature for aligning depth to thermal during calibration.
             double span=g_cmax-g_cmin; if(span<50)span=50;
