@@ -31,7 +31,7 @@ run: $(TARGET)
 	DISPLAY=:0 XAUTHORITY=/home/pi/.Xauthority \
 	     XDG_RUNTIME_DIR=/run/user/1000 \
 	     DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
-	     ./$(TARGET)
+	     ./$(TARGET) 2>/dev/null | grep --line-buffered -v "UVC: ioctl"
 
 clean:
 	rm -f $(TARGET)
