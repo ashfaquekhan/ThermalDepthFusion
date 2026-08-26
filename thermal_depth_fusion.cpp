@@ -163,10 +163,10 @@ static inline cv::Vec3b depth_color(float d){
     return lut.at<cv::Vec3b>(0,g);}
 
 // per-point scatter of depth onto thermal grid --------------------------------
-// Places the Arducam CAMERA (amplitude) image onto the thermal grid using the
-// per-point depth calibration, so the main pane overlaps thermal + arducam cam.
-// odepth (aligned depth) is still filled for capture.
-static void scatter_overlay(const cv::Mat&depth,const cv::Mat&conf,const cv::Mat&amp8,bool cal_now,bool slot_min,
+// Places the DEPTH (color-by-distance) onto the thermal grid using the per-point
+// depth calibration. odepth (aligned depth) is filled so the caller can draw the
+// distance-colored OUTLINE at depth edges for easy thermal-overlay alignment.
+static void scatter_overlay(const cv::Mat&depth,const cv::Mat&conf,bool cal_now,bool slot_min,
                             cv::Mat&ocol,cv::Mat&omask,cv::Mat&odepth){
     ocol=cv::Mat::zeros(TH,TW,CV_8UC3); omask=cv::Mat::zeros(TH,TW,CV_8U); odepth=cv::Mat::zeros(TH,TW,CV_32F);
     if(depth.empty())return;
@@ -185,8 +185,7 @@ static void scatter_overlay(const cv::Mat&depth,const cv::Mat&conf,const cv::Mat
                   x=x0+t*(x1-x0);y=y0+t*(y1-y0);}
             int xi=(int)std::lround(x),yi=(int)std::lround(y);
             if(xi<0||xi>=TW||yi<0||yi>=TH)continue;
-            uchar a = amp8.empty()?200:amp8.at<uchar>(v,u);   // arducam camera (amplitude) intensity
-            ocol.at<cv::Vec3b>(yi,xi)=cv::Vec3b(a,a,a); omask.at<uchar>(yi,xi)=255; odepth.at<float>(yi,xi)=d;
+            ocol.at<cv::Vec3b>(yi,xi)=depth_color(d); omask.at<uchar>(yi,xi)=255; odepth.at<float>(yi,xi)=d;
         }
     }
     // fill the small gaps left by forward scatter (depth 240x180 -> thermal grid)
@@ -438,15 +437,22 @@ int main(){
             }
         }
 
-        // arducam camera image (amplitude), auto-gain grayscale, used for BOTH the
-        // overlap on thermal and (colorized) the separate depth feed source.
+        // raw arducam camera image (amplitude) for the separate feed
         cv::Mat amp8;
         if(!conf_f.empty()) cv::normalize(conf_f,amp8,0,255,cv::NORM_MINMAX,CV_8U);
 
         cv::Mat ocol,omask,odepth;
-        scatter_overlay(depth_f,conf_f,amp8,g_cal_mode,g_min_slot,ocol,omask,odepth);
-        cv::Mat fused=thermal.clone();   // THERMAL + Arducam CAMERA overlapped
-        if(cv::countNonZero(omask)>0){ cv::Mat bl; cv::addWeighted(thermal,1.0-g_opacity,ocol,g_opacity,0,bl); bl.copyTo(fused,omask); }
+        scatter_overlay(depth_f,conf_f,g_cal_mode,g_min_slot,ocol,omask,odepth);
+        cv::Mat fused=thermal.clone();   // THERMAL + depth (color-by-distance + outline)
+        if(cv::countNonZero(omask)>0){
+            cv::Mat bl; cv::addWeighted(thermal,1.0-g_opacity,ocol,g_opacity,0,bl); bl.copyTo(fused,omask);
+            // crisp distance-colored OUTLINE at depth edges (object silhouettes) - the
+            // key feature for aligning depth to thermal during calibration.
+            double span=g_cmax-g_cmin; if(span<50)span=50;
+            cv::Mat d8; odepth.convertTo(d8,CV_8U,255.0/span,-g_cmin*255.0/span);
+            cv::Mat edges; cv::Canny(d8,edges,40,120); edges&=omask; cv::dilate(edges,edges,cv::Mat());
+            ocol.copyTo(fused,edges);   // vivid depth-colored outline on top of the faint fill
+        }
 
         cv::Mat ui(480,800,CV_8UC3,cv::Scalar(22,22,22));
         // main overlay
@@ -459,13 +465,11 @@ int main(){
             cv::rectangle(ui,cv::Rect(COLX,y,COLW,F_H),cv::Scalar(80,80,80),1);
             cv::putText(ui,lbl,cv::Point(COLX+4,y+15),cv::FONT_HERSHEY_SIMPLEX,0.42,lc,1);
         };
-        // DEPTH feed only (separate) - no separate arducam feed; arducam cam is
-        // overlapped on the thermal in the main pane above.
-        cv::Mat rd;
-        if(!depth_f.empty()){ double span=g_cmax-g_cmin; if(span<50)span=50;
-            cv::Mat d8; depth_f.convertTo(d8,CV_8U,255.0/span,-g_cmin*255.0/span);
-            cv::applyColorMap(d8,rd,cv::COLORMAP_JET); rd.setTo(cv::Scalar(0,0,0),conf_f<30); }
-        feed(rd,F1Y,"DEPTH",cv::Scalar(0,200,255));
+        // RAW ARDUCAM feed (amplitude) separate - the depth is now the outline
+        // overlay on the thermal in the main pane above.
+        cv::Mat rawcam;
+        if(!amp8.empty()) cv::cvtColor(amp8,rawcam,cv::COLOR_GRAY2BGR);
+        feed(rawcam,F1Y,"ARDUCAM",cv::Scalar(200,200,0));
 
         // HUD
         std::stringstream ss;
@@ -490,7 +494,7 @@ int main(){
             auto t=std::time(nullptr);auto lt=*std::localtime(&t);char st[32];std::strftime(st,sizeof(st),"%Y%m%d_%H%M%S",&lt);
             std::string b=std::string("fusion_")+st;
             cv::imwrite(b+"_thermal.png",thermal); cv::imwrite(b+"_overlay.png",fused);
-            if(!rd.empty())cv::imwrite(b+"_depth_raw.png",rd); if(!amp8.empty())cv::imwrite(b+"_arducam_cam.png",amp8);
+            if(!amp8.empty())cv::imwrite(b+"_arducam_cam.png",amp8);
             {std::ofstream f(b+"_depth_f32_"+std::to_string(TW)+"x"+std::to_string(TH)+".raw",std::ios::binary);
              if(!odepth.empty())f.write((char*)odepth.data,TW*TH*sizeof(float));}
             {std::ofstream f(b+"_meta.json");
