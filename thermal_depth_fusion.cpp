@@ -80,6 +80,15 @@ static void buildM(const Xform& x, double M[6]){
 }
 static inline void applyM(const double M[6],double u,double v,double&x,double&y){ x=M[0]*u+M[1]*v+M[2]; y=M[3]*u+M[4]*v+M[5]; }
 
+// Interpolate the depth->thermal transform by scene distance (min slot .. max slot)
+static Xform interpX(double d){
+    double span=g_cal.max_d-g_cal.min_d; if(std::abs(span)<1e-6)span=1;
+    double t=(d-g_cal.min_d)/span; t=std::max(-0.5,std::min(1.5,t));
+    const Xform&a=g_cal.min_x; const Xform&b=g_cal.max_x; Xform o;
+    o.tx=a.tx+t*(b.tx-a.tx); o.ty=a.ty+t*(b.ty-a.ty);
+    o.s=a.s+t*(b.s-a.s); o.rot=a.rot+t*(b.rot-a.rot); return o;
+}
+
 // ---------------------------------------------------------------------------
 static bool g_running=true, g_cal_mode=false, g_min_slot=true, g_cmd_capture=false;
 static bool g_outline_only=false;   // show only colored depth outlines (no fill)
@@ -444,18 +453,42 @@ int main(){
         cv::Mat amp8;
         if(!conf_f.empty()) cv::normalize(conf_f,amp8,0,255,cv::NORM_MINMAX,CV_8U);
 
-        cv::Mat ocol,omask,odepth;
-        scatter_overlay(depth_f,conf_f,g_cal_mode,g_min_slot,ocol,omask,odepth);
-        cv::Mat fused=thermal.clone();   // THERMAL + depth (color-by-distance + outline)
-        if(cv::countNonZero(omask)>0){
-            // color-by-distance fill (skipped in outline-only mode)
-            if(!g_outline_only){ cv::Mat bl; cv::addWeighted(thermal,1.0-g_opacity,ocol,g_opacity,0,bl); bl.copyTo(fused,omask); }
-            // crisp distance-colored OUTLINE at depth edges (object silhouettes) - the
-            // key feature for aligning depth to thermal during calibration.
+        // ---- temporal smoothing of depth (kills the random pixel flicker) ----
+        static cv::Mat g_dema;
+        if(!depth_f.empty()){
+            if(g_dema.empty()||g_dema.size()!=depth_f.size()) depth_f.copyTo(g_dema);
+            else { cv::Mat valid=(conf_f>=40.f)&(depth_f>150.f);
+                   cv::Mat mix; cv::addWeighted(g_dema,0.6,depth_f,0.4,0,mix); mix.copyTo(g_dema,valid); }
+        }
+
+        // ---- clean depth overlay via DENSE warp at the scene transform ----
+        // (replaces the per-point forward scatter, which was holey/noisy). One affine
+        // warp of the whole depth image -> a solid region; outline = its silhouette.
+        cv::Mat omask, odepth; cv::Mat fused=thermal.clone();
+        if(!g_dema.empty()){
+            cv::Mat ds=g_dema.clone(), cs=conf_f.clone();
+            if(g_cal.flipH){ cv::flip(ds,ds,1); cv::flip(cs,cs,1); }
+            if(g_cal.flipV){ cv::flip(ds,ds,0); cv::flip(cs,cs,0); }
+            Xform X = g_cal_mode ? (g_min_slot?g_cal.min_x:g_cal.max_x)
+                                 : interpX(std::isnan(live_d)?(g_cal.min_d+g_cal.max_d)/2:live_d);
+            double M6[6]; buildM(X,M6);
+            cv::Mat M=(cv::Mat_<double>(2,3)<<M6[0],M6[1],M6[2],M6[3],M6[4],M6[5]);
+            cv::Mat wdepth,wconf;
+            cv::warpAffine(ds,wdepth,M,cv::Size(TW,TH),cv::INTER_NEAREST,cv::BORDER_CONSTANT,cv::Scalar(0));
+            cv::warpAffine(cs,wconf,M,cv::Size(TW,TH),cv::INTER_NEAREST,cv::BORDER_CONSTANT,cv::Scalar(0));
+            cv::Mat vmask=(wconf>=40)&(wdepth>150)&(wdepth<(float)RANGE_MM*0.98f);
+            static cv::Mat k3=cv::getStructuringElement(cv::MORPH_RECT,cv::Size(3,3));
+            cv::morphologyEx(vmask,vmask,cv::MORPH_OPEN,k3);    // drop speckle
+            cv::morphologyEx(vmask,vmask,cv::MORPH_CLOSE,k3);   // fill pinholes
             double span=g_cmax-g_cmin; if(span<50)span=50;
-            cv::Mat d8; odepth.convertTo(d8,CV_8U,255.0/span,-g_cmin*255.0/span);
-            cv::Mat edges; cv::Canny(d8,edges,40,120); edges&=omask; cv::dilate(edges,edges,cv::Mat());
-            ocol.copyTo(fused,edges);   // vivid depth-colored outline on top of the faint fill
+            cv::Mat d8; wdepth.convertTo(d8,CV_8U,255.0/span,-g_cmin*255.0/span);
+            cv::Mat ocol; cv::applyColorMap(d8,ocol,cv::COLORMAP_JET);
+            if(!g_outline_only){ cv::Mat bl; cv::addWeighted(thermal,1.0-g_opacity,ocol,g_opacity,0,bl); bl.copyTo(fused,vmask); }
+            cv::Mat sil; cv::morphologyEx(vmask,sil,cv::MORPH_GRADIENT,k3);   // clean object silhouette
+            cv::Mat edg; cv::Canny(d8,edg,50,140); edg&=vmask;               // internal depth edges
+            cv::Mat outline=sil|edg; cv::dilate(outline,outline,k3);
+            ocol.copyTo(fused,outline);                                      // distance-colored outline
+            omask=vmask; wdepth.copyTo(odepth); odepth.setTo(0,~vmask);
         }
 
         cv::Mat ui(480,800,CV_8UC3,cv::Scalar(22,22,22));
